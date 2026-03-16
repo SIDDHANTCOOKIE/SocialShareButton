@@ -763,14 +763,18 @@ class SocialShareButton {
         });
         const el = this._getContainer();
         (el || document).dispatchEvent(domEvent);
-      } catch (_) {}
+      } catch (_) {
+        // ignore
+      }
     }
 
     // Path 2 — onAnalytics callback (direct, single-consumer hook)
     if (typeof this.options.onAnalytics === "function") {
       try {
         this.options.onAnalytics(payload);
-      } catch (_) {}
+      } catch (_) {
+        // ignore
+      }
     }
 
     // Path 3 — plugin / adapter registry (supports multiple simultaneous consumers)
@@ -779,7 +783,9 @@ class SocialShareButton {
         if (plugin && typeof plugin.track === "function") {
           try {
             plugin.track(payload);
-          } catch (_) {}
+          } catch (_) {
+            // ignore
+          }
         }
       }
     }
