@@ -1,0 +1,163 @@
+name: PR Labeler
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+jobs:
+  label-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Apply PR Labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Helper to parse all issue numbers out of a PR body
+            const getLinkedIssues = (body) => {
+              const issues = new Set();
+              if (!body) return issues;
+              
+              // Matches conventional keywords or just #N (e.g., "Fixes #123", "closes#123", "addresses #123", "#123")
+              const regex = /(?:fix(?:e[sd])?|clos(?:e[sd])?|resolv(?:e[sd])?|address(?:es|ed)?)?\s*#(\d+)/gi;
+              let match;
+              while ((match = regex.exec(body)) !== null) {
+                issues.add(match[1]);
+              }
+              return issues;
+            };
+
+            const body = context.payload.pull_request.body;
+            const issueNumbers = getLinkedIssues(body);
+            
+            const labelsEnsured = new Set();
+            async function ensureLabel(name, color, description) {
+              if (labelsEnsured.has(name)) return;
+              try {
+                // Check if label exists
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: name
+                });
+              } catch (error) {
+                // If label doesn't exist, create it
+                if (error.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: name,
+                    color: color,
+                    description: description
+                  });
+                } else {
+                  console.log(`Error getting label ${name}:`, error);
+                }
+              }
+              labelsEnsured.add(name);
+            }
+
+            // Ensure our required labels exist
+            await ensureLabel('issue-assigned', '0e8a16', 'PR linked to an assigned issue');
+            await ensureLabel('issue-unassigned', 'd4c5f9', 'PR linked to an unassigned issue');
+            await ensureLabel('no-linked-issue', 'e11d21', 'PR lacks a linked issue');
+            await ensureLabel('potential-duplicate', 'fbca04', 'Another open PR links to the same issue');
+
+            const labelsToAdd = new Set();
+            const labelsToRemove = new Set(['issue-assigned', 'issue-unassigned', 'no-linked-issue', 'potential-duplicate']);
+
+            if (issueNumbers.size === 0) {
+              // Rule 3: Missing Issue
+              labelsToAdd.add('no-linked-issue');
+            } else {
+              // Rules 2: Assigned vs Unassigned Label
+              let isAssigned = false;
+              for (const issueNumber of Array.from(issueNumbers)) {
+                try {
+                  const issue = await github.rest.issues.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: parseInt(issueNumber, 10)
+                  });
+                  // Ignore if it's actually referencing another PR instead of an Issue
+                  if (!issue.data.pull_request && issue.data.assignees && issue.data.assignees.length > 0) {
+                    isAssigned = true;
+                  }
+                } catch (e) {
+                  console.log(`Could not fetch issue #${issueNumber}: ${e.message}`);
+                }
+              }
+
+              if (isAssigned) {
+                labelsToAdd.add('issue-assigned');
+              } else {
+                labelsToAdd.add('issue-unassigned');
+              }
+
+              // Rule 4: Duplicate PR Detection
+              let isDuplicate = false;
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open'
+              });
+
+              for (const issueNumber of Array.from(issueNumbers)) {
+                const relatedPulls = pulls.filter(pr => {
+                  const prIssues = getLinkedIssues(pr.body);
+                  return prIssues.has(issueNumber);
+                });
+
+                if (relatedPulls.length > 1) {
+                  // Sort chronologically by creation date
+                  relatedPulls.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                  
+                  // If our current PR is not the earliest
+                  if (relatedPulls[0].number !== context.payload.pull_request.number) {
+                    isDuplicate = true;
+                    break;
+                  }
+                }
+              }
+              
+              if (isDuplicate) {
+                labelsToAdd.add('potential-duplicate');
+              }
+            }
+
+            // Prepare to modify labels on the current PR
+            for (const l of Array.from(labelsToAdd)) {
+              labelsToRemove.delete(l);
+            }
+
+            if (labelsToAdd.size > 0) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  labels: Array.from(labelsToAdd)
+                });
+              } catch (e) {
+                console.log(`Failed to add labels: ${e.message}`);
+              }
+            }
+
+            // Clean up any stale labels
+            const currentLabels = context.payload.pull_request.labels.map(l => l.name);
+            for (const label of Array.from(labelsToRemove)) {
+              if (currentLabels.includes(label)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    name: label
+                  });
+                } catch (e) {
+                  console.log(`Failed to remove ${label}: ${e.message}`);
+                }
+              }
+            }
